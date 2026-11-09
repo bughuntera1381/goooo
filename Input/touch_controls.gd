@@ -1,5 +1,5 @@
 extends Control
-## Multi-touch HUD controls: floating joystick, action buttons, drag-to-look.
+## Multi-touch HUD controls: joystick, action buttons, drag-to-look, gyro aiming.
 ## Every finger is tracked by its index, so thumbs never interfere with each other.
 
 signal settings_requested
@@ -7,13 +7,24 @@ signal settings_requested
 const CFG_PATH := "user://hud.cfg"
 # Bump this number whenever the default button layout changes.
 # Old saved layouts with a different version are ignored automatically.
-const LAYOUT_VERSION := 2
+const LAYOUT_VERSION := 3
 const STICK_R := 85.0
+const R_MIN := 20.0
+const R_MAX := 120.0
+
+# ---- Gyro tuning ----
+# If gyro looks reversed on your phone, change the matching sign to -1.0
+const GYRO_YAW_SIGN := 1.0
+const GYRO_PITCH_SIGN := 1.0
+# Higher = faster gyro turning
+const GYRO_PX_PER_RAD := 450.0
 
 var active := false
 var edit_mode := false
 var hud_scale := 1.0
 var sens := 1.0
+var gyro_enabled := true
+var gyro_sens := 1.0
 
 var move_vec := Vector2.ZERO
 var sprint := false
@@ -27,6 +38,7 @@ var buttons := {
 	"slide": {"pos": Vector2(0.94, 0.36), "r": 40.0, "label": "SLIDE", "look": false, "col": Color(0.5, 1.0, 0.6)},
 	"reload": {"pos": Vector2(0.70, 0.78), "r": 34.0, "label": "RELOAD", "look": false, "col": Color(1, 1, 1)},
 	"switch": {"pos": Vector2(0.60, 0.68), "r": 30.0, "label": "SWAP", "look": false, "col": Color(1, 1, 1)},
+	"gyro": {"pos": Vector2(0.955, 0.22), "r": 26.0, "label": "GYRO", "look": false, "col": Color(0.9, 0.6, 1.0)},
 	"gear": {"pos": Vector2(0.955, 0.09), "r": 24.0, "label": "II", "look": false, "col": Color(1, 1, 1)},
 }
 var _defaults := {}
@@ -39,6 +51,7 @@ var _stick_home := Vector2(0.13, 0.74)
 var _jump_edge := false
 var _reload_edge := false
 var _switch_edge := false
+var _selected := ""     # button selected in edit mode
 
 var fire_held: bool:
 	get:
@@ -108,11 +121,32 @@ func _hit_button(p: Vector2) -> String:
 			best_d = d
 	return best
 
+# Edit-mode resize buttons ("-" left, "+" right, bottom center).
+func _size_pad(sign_: int) -> Vector2:
+	return Vector2(size.x * (0.5 + 0.07 * sign_), size.y * 0.90)
+
+func _hit_size_pad(p: Vector2) -> int:
+	if p.distance_to(_size_pad(-1)) <= 40.0:
+		return -1
+	if p.distance_to(_size_pad(1)) <= 40.0:
+		return 1
+	return 0
+
+func _resize_selected(dir: int) -> void:
+	if _selected != "" and buttons.has(_selected):
+		var r: float = float(buttons[_selected]["r"])
+		buttons[_selected]["r"] = clampf(r + 6.0 * dir, R_MIN, R_MAX)
+	else:
+		hud_scale = clampf(hud_scale + 0.05 * dir, 0.6, 1.6)
+	save_layout()
+
 func _input(event: InputEvent) -> void:
 	if not (active or edit_mode):
 		return
 	if event is InputEventScreenTouch:
-		if event.pressed:
+		if event.pressed and not event.canceled:
+			# Clear any stale state for a reused finger index, then press.
+			_release(event.index)
 			_press(event.index, event.position)
 		else:
 			_release(event.index)
@@ -120,12 +154,21 @@ func _input(event: InputEvent) -> void:
 		_drag(event.index, event.position, event.relative)
 
 func _press(idx: int, pos: Vector2) -> void:
-	var bn := _hit_button(pos)
 	if edit_mode:
-		if bn != "":
-			_fingers[idx] = "edit:" + bn
+		var sp := _hit_size_pad(pos)
+		if sp != 0:
+			_resize_selected(sp)
+			return
+		var eb := _hit_button(pos)
+		if eb != "":
+			_selected = eb
+			_fingers[idx] = "edit:" + eb
 		return
+	var bn := _hit_button(pos)
 	if bn != "":
+		# If this button was held by another (stale) finger, free that one.
+		if _btn_finger.has(bn):
+			_fingers.erase(_btn_finger[bn])
 		_btn_finger[bn] = idx
 		_fingers[idx] = bn
 		match bn:
@@ -135,6 +178,11 @@ func _press(idx: int, pos: Vector2) -> void:
 				_reload_edge = true
 			"switch":
 				_switch_edge = true
+			"gyro":
+				_btn_finger.erase(bn)
+				_fingers.erase(idx)
+				gyro_enabled = not gyro_enabled
+				save_layout()
 			"gear":
 				_btn_finger.erase(bn)
 				_fingers.erase(idx)
@@ -175,27 +223,43 @@ func _release(idx: int) -> void:
 		_stick_finger = -1
 		move_vec = Vector2.ZERO
 		sprint = false
-	elif _btn_finger.has(role):
+	elif role.begins_with("edit:"):
+		save_layout()
+	elif _btn_finger.has(role) and _btn_finger[role] == idx:
 		_btn_finger.erase(role)
 
+# Joystick is now fixed where you first touch: it no longer follows your finger,
+# so pushing forward keeps the same center and sprint/slide stay reliable.
 func _update_stick() -> void:
 	var r := STICK_R * hud_scale
 	var d := _stick_pos - _stick_center
-	var l := d.length()
-	if l > r:
-		_stick_center += d.normalized() * (l - r)
-		d = _stick_pos - _stick_center
 	var v := Vector2(d.x, -d.y) / r
 	if v.length() < 0.12:
 		v = Vector2.ZERO
 	move_vec = v.limit_length(1.0)
 	var m := move_vec.length()
-	if m > 0.92:
+	if m > 0.85:
 		sprint = true
 	elif m < 0.35:
 		sprint = false
 
-func _process(_delta: float) -> void:
+func _apply_gyro(delta: float) -> void:
+	if not gyro_enabled:
+		return
+	var g := Input.get_gyroscope()
+	if g == Vector3.ZERO:
+		return
+	var flip := 1.0
+	if DisplayServer.screen_get_orientation() == DisplayServer.SCREEN_REVERSE_LANDSCAPE:
+		flip = -1.0
+	var k := GYRO_PX_PER_RAD * gyro_sens * delta * flip
+	# In landscape, device X axis = screen vertical (yaw), device Y axis = screen horizontal (pitch).
+	look_delta.x += -g.x * GYRO_YAW_SIGN * k
+	look_delta.y += -g.y * GYRO_PITCH_SIGN * k
+
+func _process(delta: float) -> void:
+	if active and not edit_mode:
+		_apply_gyro(delta)
 	if active or edit_mode:
 		queue_redraw()
 
@@ -220,11 +284,24 @@ func _draw() -> void:
 		var br: float = float(b["r"]) * hud_scale
 		var col: Color = b["col"]
 		var down: bool = _btn_finger.has(k)
+		if k == "gyro":
+			down = gyro_enabled
 		draw_circle(c, br, Color(col.r, col.g, col.b, 0.38 if down else 0.14))
 		draw_arc(c, br, 0.0, TAU, 40, Color(col.r, col.g, col.b, 0.9 if down else 0.55), 2.5, true)
+		if edit_mode and k == _selected:
+			draw_arc(c, br + 5.0, 0.0, TAU, 40, Color(1, 1, 0.3, 1.0), 3.5, true)
 		draw_string(font, c + Vector2(-br, fs * 0.35), String(b["label"]), HORIZONTAL_ALIGNMENT_CENTER, br * 2.0, fs, Color(1, 1, 1, 0.95))
 	if edit_mode:
 		draw_string(font, Vector2(0, size.y * 0.2), "DRAG BUTTONS TO MOVE THEM", HORIZONTAL_ALIGNMENT_CENTER, size.x, 28, Color(1, 0.8, 0.3))
+		var tip := "TAP A BUTTON, THEN USE - / + TO RESIZE IT"
+		if _selected != "":
+			tip = "SELECTED: %s   (- / + to resize)" % String(buttons[_selected]["label"])
+		draw_string(font, Vector2(0, size.y * 0.27), tip, HORIZONTAL_ALIGNMENT_CENTER, size.x, 20, Color(1, 1, 1, 0.85))
+		for sgn in [-1, 1]:
+			var pc := _size_pad(sgn)
+			draw_circle(pc, 34.0, Color(1, 1, 1, 0.18))
+			draw_arc(pc, 34.0, 0.0, TAU, 32, Color(1, 1, 1, 0.8), 2.5, true)
+			draw_string(font, pc + Vector2(-34.0, 12.0), "+" if sgn > 0 else "-", HORIZONTAL_ALIGNMENT_CENTER, 68.0, 36, Color.WHITE)
 
 func save_layout() -> void:
 	var cf := ConfigFile.new()
@@ -232,28 +309,36 @@ func save_layout() -> void:
 	for k in buttons.keys():
 		var p: Vector2 = buttons[k]["pos"]
 		cf.set_value("buttons", String(k), p)
+		cf.set_value("radius", String(k), float(buttons[k]["r"]))
 	cf.set_value("settings", "hud_scale", hud_scale)
 	cf.set_value("settings", "sens", sens)
+	cf.set_value("settings", "gyro_enabled", gyro_enabled)
+	cf.set_value("settings", "gyro_sens", gyro_sens)
 	cf.save(CFG_PATH)
 
 func load_layout() -> void:
 	var cf := ConfigFile.new()
 	if cf.load(CFG_PATH) != OK:
 		return
-	# Always keep user settings (scale + sensitivity).
+	# Always keep user settings.
 	hud_scale = clampf(float(cf.get_value("settings", "hud_scale", 1.0)), 0.6, 1.6)
 	sens = clampf(float(cf.get_value("settings", "sens", 1.0)), 0.3, 2.5)
-	# Only restore saved button positions if they match the current layout version.
-	# Otherwise the new default layout is used.
+	gyro_enabled = bool(cf.get_value("settings", "gyro_enabled", true))
+	gyro_sens = clampf(float(cf.get_value("settings", "gyro_sens", 1.0)), 0.2, 3.0)
+	# Only restore saved button positions/sizes if they match the current layout version.
 	if int(cf.get_value("meta", "layout_version", 0)) != LAYOUT_VERSION:
 		return
 	for k in buttons.keys():
 		var p = cf.get_value("buttons", String(k), buttons[k]["pos"])
 		if p is Vector2:
 			buttons[k]["pos"] = p
+		var rr = cf.get_value("radius", String(k), buttons[k]["r"])
+		buttons[k]["r"] = clampf(float(rr), R_MIN, R_MAX)
 
 func reset_layout() -> void:
 	for k in buttons.keys():
 		buttons[k]["pos"] = _defaults[k]["pos"]
+		buttons[k]["r"] = _defaults[k]["r"]
 	hud_scale = 1.0
+	_selected = ""
 	save_layout()
