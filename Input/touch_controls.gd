@@ -51,9 +51,15 @@ var slide_held: bool:
 		return _btn_finger.has("slide")
 
 func _ready() -> void:
-	set_anchors_preset(Control.PRESET_FULL_RECT)
 	mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_fit()
+	get_viewport().size_changed.connect(_fit)
 	_defaults = buttons.duplicate(true)
+
+func _fit() -> void:
+	set_anchors_preset(Control.PRESET_TOP_LEFT)
+	position = Vector2.ZERO
+	size = get_viewport_rect().size
 
 func consume_look() -> Vector2:
 	var d := look_delta
