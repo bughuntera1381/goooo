@@ -17,9 +17,15 @@ var dmg_marks: Array = []
 var font: Font
 
 func _ready() -> void:
-	set_anchors_preset(Control.PRESET_FULL_RECT)
 	mouse_filter = Control.MOUSE_FILTER_IGNORE
 	font = ThemeDB.fallback_font
+	_fit()
+	get_viewport().size_changed.connect(_fit)
+
+func _fit() -> void:
+	set_anchors_preset(Control.PRESET_TOP_LEFT)
+	position = Vector2.ZERO
+	size = get_viewport_rect().size
 
 func show_banner(text: String, col: Color, t := 1.6) -> void:
 	banner = text
